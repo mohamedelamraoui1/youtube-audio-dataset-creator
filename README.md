@@ -151,6 +151,24 @@ npm run dev
 
 Open your browser and navigate to http://localhost:5173
 
+## 📸 Screenshots
+
+### Main Interface
+
+![Application Interface - Screen 1](screen_1.PNG)
+
+### Audio Processing Form
+
+![Processing Form - Screen 2](screen_2.PNG)
+
+### Processing Progress
+
+![Progress Tracking - Screen 3](sereen_3.PNG)
+
+### Results & Quality Analysis
+
+![Results Display - Screen 4](screen_4.PNG)
+
 ## 📖 How to Use
 
 1. **Open the application** in your browser: http://localhost:5173
