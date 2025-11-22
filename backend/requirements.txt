@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+yt-dlp
+pydub
+pydantic
+python-multipart
+youtube-transcript-api>=0.6.1
+openai-whisper
+torch
+torchaudio
