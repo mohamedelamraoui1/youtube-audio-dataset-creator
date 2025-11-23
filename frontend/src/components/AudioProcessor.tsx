@@ -20,6 +20,7 @@ const AudioProcessor = () => {
   const [error, setError] = useState<string>('');
   const [progress, setProgress] = useState<string>('');
   const [segmentUnit, setSegmentUnit] = useState<'minutes' | 'seconds'>('minutes');
+  const [analyzeQuality, setAnalyzeQuality] = useState(true);
 
   // Quality checklist state
   const [qualityChecks, setQualityChecks] = useState({
@@ -55,7 +56,7 @@ const AudioProcessor = () => {
     setFormData((prev) => ({ ...prev, [name]: finalValue }));
   };
 
-  const handleCheckboxChange = (name: string) => {
+  const handleCheckboxChange = (name: 'noBackgroundSound' | 'onlyOnePerson') => {
     setQualityChecks((prev) => ({
       ...prev,
       [name]: !prev[name],
@@ -84,12 +85,18 @@ const AudioProcessor = () => {
 
     try {
       setTimeout(() => setProgress('Downloading audio... (25%)'), 1000);
-      setTimeout(() => setProgress('Analyzing audio quality... (50%)'), 2000);
-      setTimeout(() => setProgress('Trimming and splitting audio... (75%)'), 3000);
+      if (analyzeQuality) {
+        setTimeout(() => setProgress('Analyzing audio quality... (50%)'), 2000);
+        setTimeout(() => setProgress('Trimming and splitting audio... (75%)'), 3000);
+      } else {
+        setTimeout(() => setProgress('Trimming and splitting audio... (50%)'), 2000);
+        setTimeout(() => setProgress('Almost done... (75%)'), 3000);
+      }
       
       const response = await api.processAudio({
         ...formData,
         quality_checked: qualityChecks.noBackgroundSound && qualityChecks.onlyOnePerson,
+        analyze_quality: analyzeQuality,
       });
       setProgress('Processing complete! (100%)');
       setResult(response);
@@ -250,6 +257,25 @@ const AudioProcessor = () => {
               />
               <p className="text-xs text-gray-400 mt-1">Seconds to remove from end</p>
             </div>
+          </div>
+
+          {/* Audio Quality Analysis Toggle */}
+          <div className="bg-blue-900/20 border border-blue-700/50 rounded-lg p-4">
+            <label className="flex items-center space-x-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={analyzeQuality}
+                onChange={(e) => setAnalyzeQuality(e.target.checked)}
+                className="w-5 h-5 text-blue-600 bg-gray-600 border-gray-500 rounded focus:ring-blue-500 focus:ring-2"
+                disabled={loading}
+              />
+              <div className="flex-1">
+                <span className="text-white font-medium">Analyze Audio Quality</span>
+                <p className="text-xs text-gray-400 mt-1">
+                  Check for background noise and speech patterns (adds ~30-60 seconds to processing)
+                </p>
+              </div>
+            </label>
           </div>
 
           {/* Segment Duration */}
@@ -414,12 +440,22 @@ const AudioProcessor = () => {
                       Speech Activity: {(result.audio_checks.speech_ratio * 100).toFixed(1)}%
                     </p>
                   )}
-                  {result.audio_checks.quality_score !== null && (
+                  {result.audio_checks.quality_score !== undefined && result.audio_checks.quality_score !== null && (
                     <p>
                       Overall Quality Score: {(result.audio_checks.quality_score * 100).toFixed(0)}%
                     </p>
                   )}
                 </div>
+              </div>
+            )}
+            
+            {/* Skipped Quality Analysis Message */}
+            {!analyzeQuality && (
+              <div className="bg-blue-900/30 border border-blue-700/50 rounded-lg p-4">
+                <p className="text-blue-200">
+                  <Info className="w-4 h-4 inline mr-2" />
+                  Audio quality analysis was skipped for faster processing
+                </p>
               </div>
             )}
 

@@ -11,6 +11,7 @@ export interface AudioRequest {
   trim_start?: number;
   trim_end?: number;
   segment_duration?: number;
+  analyze_quality?: boolean;
 }
 
 export interface AudioResponse {

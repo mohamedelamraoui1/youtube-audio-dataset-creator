@@ -11,6 +11,8 @@ import uuid
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
@@ -52,6 +54,7 @@ class AudioRequest(BaseModel):
     trim_end: int = 20  # seconds to trim from end
     segment_duration: float = 7  # minutes per segment
     video_id: str = ""  # YouTube video ID for transcript
+    analyze_quality: bool = True  # Whether to perform audio quality analysis
 
 class AudioResponse(BaseModel):
     success: bool
@@ -68,18 +71,27 @@ def ensure_directories():
         (DATA_DIR / lang / "script").mkdir(exist_ok=True)
 
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from URL"""
+    """Extract YouTube video ID from URL - handles all formats (regular, playlist, shared, etc.)"""
+    # Handle all possible YouTube URL formats
     patterns = [
-        r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)',
-        r'youtube\.com\/watch\?.*v=([^&\n?#]+)',
+        r'(?:youtube\.com\/watch\?v=)([^&\n?#]+)',  # Standard watch URL
+        r'(?:youtu\.be\/)([^&\n?#\?]+)',  # Shortened URL
+        r'(?:youtube\.com\/embed\/)([^&\n?#\?]+)',  # Embed URL
+        r'(?:youtube\.com\/v\/)([^&\n?#\?]+)',  # Old embed format
+        r'(?:youtube\.com\/shorts\/)([^&\n?#\?]+)',  # YouTube Shorts
+        r'(?:youtube\.com\/watch\?.*[&?]v=)([^&\n?#]+)',  # Watch with other params
     ]
     
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            return match.group(1)
+            video_id = match.group(1)
+            # Remove any remaining query parameters or fragments
+            video_id = video_id.split('&')[0].split('?')[0].split('#')[0]
+            print(f"[INFO] Extracted video ID: {video_id}")
+            return video_id
     
-    raise ValueError("Invalid YouTube URL format")
+    raise ValueError(f"Invalid YouTube URL format: {url}")
 
 def get_youtube_transcript(video_id: str, language_code: str = None) -> str:
     """Fetch transcript from YouTube using youtube-transcript-api"""
@@ -117,6 +129,8 @@ def get_youtube_transcript(video_id: str, language_code: str = None) -> str:
 
 def download_audio(url: str, output_path: str) -> tuple[str, str]:
     """Download audio from YouTube and return audio path + video ID"""
+    print("[STEP 1/5] 🎥 Downloading audio from YouTube...")
+    
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_path,
@@ -126,20 +140,29 @@ def download_audio(url: str, output_path: str) -> tuple[str, str]:
         }],
         'quiet': True,
         'no_warnings': True,
+        'noplaylist': True,  # Important: don't download entire playlist, just the video
+        'extract_flat': False,
     }
     
     try:
-        # Extract video ID
+        # Extract video ID first
         video_id = extract_video_id(url)
         
+        # Use video ID directly to avoid playlist issues
+        direct_url = f"https://www.youtube.com/watch?v={video_id}"
+        print(f"[INFO] Using direct video URL: {direct_url}")
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([direct_url])
+        
+        print("[STEP 1/5] ✅ Audio downloaded successfully")
         return output_path + ".wav", video_id
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
 
 def analyze_audio_quality(audio_path: str) -> Dict:
     """Analyze audio for background noise and speech activity"""
+    print("[STEP 2/5] 📊 Analyzing audio quality...")
     try:
         audio = AudioSegment.from_wav(audio_path)
         
@@ -161,6 +184,7 @@ def analyze_audio_quality(audio_path: str) -> Dict:
         # 3. Simplified quality check
         likely_single_speaker = speech_ratio > 0.5 and speech_ratio < 0.95
         
+        print("[STEP 2/5] ✅ Audio quality analysis complete")
         return {
             "has_low_bg_noise": bool(has_low_bg_noise),
             "speech_ratio": float(speech_ratio),
@@ -169,6 +193,7 @@ def analyze_audio_quality(audio_path: str) -> Dict:
             "quality_score": float((has_low_bg_noise * 0.5 + likely_single_speaker * 0.5))
         }
     except Exception as e:
+        print(f"[STEP 2/5] ⚠️ Audio quality analysis failed: {str(e)}")
         return {
             "error": str(e),
             "has_low_bg_noise": None,
@@ -178,6 +203,7 @@ def analyze_audio_quality(audio_path: str) -> Dict:
 
 def trim_audio(audio_path: str, output_path: str, start_seconds: int = 20, end_seconds: int = 20):
     """Trim audio by removing first and last N seconds"""
+    print(f"[STEP 3/5] ✂️ Trimming audio (removing {start_seconds}s from start, {end_seconds}s from end)...")
     audio = AudioSegment.from_wav(audio_path)
     
     # Convert seconds to milliseconds
@@ -189,6 +215,7 @@ def trim_audio(audio_path: str, output_path: str, start_seconds: int = 20, end_s
     
     # Save
     audio_trimmed.export(output_path, format="wav")
+    print("[STEP 3/5] ✅ Audio trimmed successfully")
     return output_path
 
 def split_transcript_by_time(full_transcript: str, segment_duration_minutes: float, total_audio_duration_ms: int) -> List[str]:
@@ -215,19 +242,17 @@ def split_transcript_by_time(full_transcript: str, segment_duration_minutes: flo
     return segments
 
 def split_audio(audio_path: str, output_dir: Path, base_filename: str, language: str, video_id: str, segment_duration: float = 7.0):
-    """Split audio into segments and generate transcripts from YouTube"""
+    """Split audio into segments and create placeholder transcript files"""
+    print(f"[STEP 4/5] 🔪 Splitting audio into {segment_duration}-minute segments...")
     audio = AudioSegment.from_wav(audio_path)
     
     # Convert minutes to milliseconds
     segment_ms = int(segment_duration * 60 * 1000)
     total_ms = len(audio)
+    num_segments = (total_ms + segment_ms - 1) // segment_ms  # Calculate total segments
     
-    # Get full transcript from YouTube
-    print(f"Fetching transcript from YouTube for video ID: {video_id}...")
-    full_transcript = get_youtube_transcript(video_id, language)
-    
-    # Split transcript into segments
-    transcript_segments = split_transcript_by_time(full_transcript, segment_duration, total_ms)
+    print(f"[INFO] Total audio duration: {total_ms / 60000:.2f} minutes")
+    print(f"[INFO] Will create {num_segments} segments")
     
     # Split into segments
     segment_files = []
@@ -242,23 +267,32 @@ def split_audio(audio_path: str, output_dir: Path, base_filename: str, language:
         segment_path = output_dir / segment_filename
         segment.export(str(segment_path), format="wav")
         segment_files.append(segment_filename)
+        print(f"[INFO] Created: {segment_filename}")
         
-        # Get corresponding transcript segment
-        transcript_text = transcript_segments[segment_num - 1] if segment_num <= len(transcript_segments) else full_transcript
-        
-        # Create script file with transcript
+        # Create placeholder transcript file
         script_filename = f"{base_filename}_part{segment_num}.txt"
         script_path = output_dir / "script" / script_filename
+        
+        # Ensure script directory exists
+        script_path.parent.mkdir(exist_ok=True)
+        
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(f"# Transcript for {segment_filename}\n")
             f.write(f"# Language: {language}\n")
             f.write(f"# Duration: ~{segment_duration} minutes\n")
-            f.write(f"# Source: YouTube Auto-Generated Captions\n\n")
-            f.write(transcript_text + "\n")
+            f.write(f"# Source: YouTube Auto-Generated Captions\n")
+            f.write(f"\n")
+            f.write(f"# ⚠️ AUTOMATIC TRANSCRIPT FETCHING NOT YET DEVELOPED\n")
+            f.write(f"# TODO: Add transcript manually or wait for future implementation\n")
+            f.write(f"#\n")
+            f.write(f"# This is a placeholder file. Please add the transcript content below:\n")
+            f.write(f"\n")
+            f.write(f"[Your transcript text here]\n")
         
-        print(f"Generated transcript for part {segment_num}")
+        print(f"[INFO] Created placeholder transcript: script/{script_filename}")
         segment_num += 1
     
+    print(f"[STEP 4/5] ✅ Split complete: {len(segment_files)} audio files + {len(segment_files)} transcript placeholders")
     return segment_files
 
 @app.get("/")
@@ -274,6 +308,14 @@ async def process_audio(request: AudioRequest):
     ensure_directories()
     
     try:
+        print("\n" + "="*60)
+        print("🚀 STARTING AUDIO PROCESSING")
+        print("="*60)
+        print(f"[INFO] Title: {request.title}")
+        print(f"[INFO] Language: {request.language}")
+        print(f"[INFO] URL: {request.url}")
+        print("="*60 + "\n")
+        
         # Generate unique ID for this processing job
         job_id = str(uuid.uuid4())[:8]
         
@@ -281,8 +323,19 @@ async def process_audio(request: AudioRequest):
         temp_audio_path = str(TEMP_DIR / f"{job_id}_original")
         downloaded_file, video_id = download_audio(request.url, temp_audio_path)
         
-        # Analyze audio quality
-        audio_checks = analyze_audio_quality(downloaded_file)
+        # Analyze audio quality only if requested
+        if request.analyze_quality:
+            audio_checks = analyze_audio_quality(downloaded_file)
+        else:
+            print("[STEP 2/5] ⏭️ Skipping audio quality analysis (disabled by user)")
+            audio_checks = {
+                "has_low_bg_noise": None,
+                "speech_ratio": None,
+                "likely_single_speaker": None,
+                "avg_loudness_dbfs": None,
+                "quality_score": None,
+                "skipped": True
+            }
         
         # Trim audio (remove first and last N seconds based on user input)
         trimmed_audio_path = str(TEMP_DIR / f"{job_id}_trimmed.wav")
@@ -292,21 +345,30 @@ async def process_audio(request: AudioRequest):
         output_dir = DATA_DIR / request.language
         base_filename = f"{request.title}_{request.language}_{request.gender}"
         
-        # Split audio into segments and generate transcripts
+        # Split audio into segments and create transcript placeholders
         segment_files = split_audio(
             trimmed_audio_path, 
             output_dir, 
             base_filename, 
             request.language,
+            video_id,
             request.segment_duration
         )
         
         # Cleanup temp files
+        print("[STEP 5/5] 🧹 Cleaning up temporary files...")
         try:
             os.remove(downloaded_file)
             os.remove(trimmed_audio_path)
-        except:
-            pass
+            print("[STEP 5/5] ✅ Cleanup complete")
+        except Exception as cleanup_error:
+            print(f"[WARNING] Cleanup failed: {cleanup_error}")
+        
+        print("\n" + "="*60)
+        print("✅ PROCESSING COMPLETE!")
+        print(f"📁 Created {len(segment_files)} audio files in: data/{request.language}/")
+        print(f"📄 Created {len(segment_files)} transcript placeholders in: data/{request.language}/script/")
+        print("="*60 + "\n")
         
         return AudioResponse(
             success=True,
@@ -316,6 +378,10 @@ async def process_audio(request: AudioRequest):
         )
         
     except Exception as e:
+        print("\n" + "="*60)
+        print("❌ PROCESSING FAILED")
+        print(f"Error: {str(e)}")
+        print("="*60 + "\n")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/files/{language}")

@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import AudioProcessor from './components/AudioProcessor'
 import './App.css'
 
